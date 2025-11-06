@@ -1,0 +1,152 @@
+function [channelEstRG, noiseEst, rsrp, epre, timeAlignment, cfo] = ...
+    srsChannelEstimator(receivedRG, pilots, betaDMRS, hop1, hop2, config)
+
+    % Pilots has as many slices (third dimension) as the number of layers.
+    nLayers = size(pilots, 3);
+
+    cfoCompensate = true;
+    if (isfield(config, 'CFOCompensate'))
+        cfoCompensate = config.CFOCompensate;
+    end
+
+    channelEstRG = complex(zeros([size(receivedRG), nLayers]));
+    noiseEst = 0;
+    rsrp = 0;
+    epre = 0;
+    timeAlignment = 0;
+    cfo = [];
+
+    nPilotSymbolsHop1 = sum(hop1.DMRSsymbols);
+
+    scs = config.scs;
+
+    if isfield(config, 'Smoothing')
+        smoothing = config.Smoothing;
+    else
+        smoothing = 'filter';
+    end
+
+    if (cfoCompensate)
+        % Compute the start time of all OFDM symbols from the start of the slot, expressed in
+        % units of OFDM symbol time.
+        CyclicPrefixDurations = config.CyclicPrefixDurations * scs / 1000;
+        symbolStartTime = cumsum([CyclicPrefixDurations(1) CyclicPrefixDurations(2:14) + 1]);
+    end
+
+    processHop(hop1, pilots(:, 1:nPilotSymbolsHop1, :), smoothing);
+
+    allDMRSsymbols = hop1.DMRSsymbols;
+    if ~isempty(hop2.DMRSsymbols)
+        assert(~any(hop1.DMRSsymbols & hop2.DMRSsymbols), "Hops should not overlap.");
+        allDMRSsymbols = allDMRSsymbols | hop2.DMRSsymbols;
+
+        assert(all(hop1.DMRSREmask == hop2.DMRSREmask, 'all'), ...
+            "The DM-RS mask should be the same for the two hops.");
+
+        processHop(hop2, pilots(:, (nPilotSymbolsHop1 + 1):end, :), smoothing);
+    end
+
+    nDMRSsymbols = sum(allDMRSsymbols);
+    nPilots = hop1.nPRBs * sum(hop1.DMRSREmask(:, 1)) * nDMRSsymbols;
+
+    rsrp = rsrp / nPilots / nLayers;
+    epre = epre / nPilots;
+
+    noiseEst = noiseEst / (ceil(nLayers / 2) * nPilots - 1);
+
+    if ~isempty(hop2.DMRSsymbols)
+        timeAlignment = timeAlignment / 2;
+    end
+
+    if (cfoCompensate && ~isempty(cfo))
+        PHcorrection = 2 * pi * symbolStartTime * cfo;
+        % Apply the phase shifts caused by the CFO to the channel estimates, so they
+        % can be compensated by the channel equalizer.
+        channelEstRG = channelEstRG .* reshape(exp(1j * PHcorrection), 1, []);
+    end
+
+    % Convert CFO from normalized units to hertz.
+    cfo = cfo * scs;
+
+    %     Nested functions
+    %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+    function processHop(hop_, pilots_, smoothing_)
+    %Processes the DM-RS corresponding to a single hop.
+
+        % Number of layers and number of CDM groups (2 layers per group).
+        nLayers_ = size(pilots_, 3);
+        nCDM_ = ceil(nLayers_ / 2);
+
+        receivedPilots_ = complex(nan([size(pilots_, [1 2]), nCDM_]));
+        recXpilots_ = complex(nan(size(pilots_)));
+
+        for iCDM_ = 1:nCDM_
+            % Create a mask for all subcarriers carrying DM-RS.
+            maskPRBs_ = hop_.maskPRBs;
+            maskREs_ = (kron(maskPRBs_, hop_.DMRSREmask(:, iCDM_)) > 0);
+
+            % Pick the REs corresponding to the pilots.
+            receivedPilots_(:, :, iCDM_) = receivedRG(maskREs_, hop_.DMRSsymbols);
+
+            % Compute receive side DM-RS EPRE.
+            epre = epre + norm(receivedPilots_(:, :, iCDM_), 'fro')^2;
+
+            % LSE-estimate the channel coefficients of the subcarriers carrying DM-RS.
+            nDMRSsymbols_ = sum(hop_.DMRSsymbols);
+            firstLayer_ = (iCDM_ - 1) * 2 + 1;
+            lastLayer_ = min(nLayers_, iCDM_ * 2);
+            %recXpilots_(:, :, firstLayer_:lastLayer_) = receivedPilots_(:, :, iCDM_) .* conj(pilots_(:, :, firstLayer_:lastLayer_));
+n=hop_.nPRBs*12;
+N=sum(hop_.DMRSsymbols);
+SNR=20;% db
+noiseVar = 10^(SNR*0.1);
+nDMRSSymbols=sum(hop_.DMRSsymbols);
+Np = hop_.nPRBs * sum(hop_.DMRSREmask);% Number of Pilots
+if numel(Np) == 1
+    % Scalar value, use directly
+    Np = Np;
+elseif size(Np,2) == 2
+    % Two columns: take average of first and second column
+    Np = (Np(:,1) + Np(:,2)) / 2;
+end
+
+h_cir=randn(1,n)+1j* randn(1,n);
+h_cir=h_cir./norm(h_cir);
+k=0:length(h_cir)-1;
+hh = h_cir*h_cir'; 
+ %tmp = h_CIR.*conj(h_CIR).*k;
+r = sum(h_cir.*conj(h_cir).*k)/hh;  
+r2 = (h_cir.*conj(h_cir).*k)*k.'/hh;
+t_rms = sqrt(r2-r^2);     % rms delay
+D = 1j*2*pi*t_rms/N; 
+for i = firstLayer_:lastLayer_
+    % Generate matrices for layer i
+    H_LS(:, :,i)=receivedPilots_(:, :, iCDM_) .* conj(pilots_(:, :,i));
+    K1(:, :, i)  = repmat([0:Np-1].', 1, Np); 
+    K2(:, :, i)  = repmat([0:Np-1], Np, 1);
+    K3(:, :, i)  = repmat([0:Np-1].', 1, Np);
+    K4(:, :, i)  = repmat([0:Np-1], Np, 1);
+
+    rf(:, :, i)  = 1 ./ (1 + D * ((K1(:, :, i) - K2(:, :, i)) * nDMRSSymbols));
+    rf2(:, :, i) = 1 ./ (1 + D * nDMRSSymbols * (K3(:, :, i) - K4(:, :, i)));
+
+    Rhp(:, :, i) = rf(:, :, i); 
+    Rpp(:, :, i) = rf2(:, :, i) + eye(length(H_LS), length(H_LS)) / noiseVar;
+
+    % MMSE estimation
+    recXpilots_(:, :, i) = Rhp(:, :, i) * inv(Rpp(:, :, i)) * H_LS(:, :, i); 
+end
+
+        
+        end
+      
+
+        [recXpilotsNOCFO_, cfoHop_] = compensateCFO(recXpilots_, ...
+            hop_.DMRSsymbols, scs / 1000, config.CyclicPrefixDurations, cfoCompensate);
+        if ~isempty(cfoHop_)
+            if ~isempty(cfo)
+                cfo = (cfo + cfoHop_) / 2;
+            else
+                cfo = cfoHop_;
+            end
+        end
